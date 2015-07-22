@@ -2,6 +2,7 @@
 use strict;
 use warnings;
 use feature ':5.10';
+use Data::Dumper;
 
 sub print_usage() {
 	say "$0 is a bash shell script minifier/obfuscator.";
@@ -16,6 +17,7 @@ sub print_usage() {
 	say "\t\t\tThe default is 'a', which means all variables will be changed to a0,a1,a2,a3,...";
 	say "\t\t-C\tis an option to clean out full line comments and blank lines.";
 	say "\t\t-F\tis an option to flatten out the code (remove indentations)";
+	say "\t\t-A\tis an option to aggressive obfuscation (implies using -F and -C)(tries to put more content on same line when possible)";
 	exit 0;
 }
 
@@ -25,6 +27,7 @@ sub parse_cmd_args {
 	my $delete_blanks="";
 	my $flatten="";
 	my $new_variable_prefix="a";
+	my $aggressive="";
 	for my $argnum (0 .. $#ARGV) {
 		if ($ARGV[$argnum] eq "-i") {
 			$input_file=$ARGV[$argnum+1];
@@ -41,13 +44,17 @@ sub parse_cmd_args {
 			$delete_blanks=1;
 		} elsif ($ARGV[$argnum] eq "-F") {
 			$flatten=1;
+		} elsif ($ARGV[$argnum] eq "-A") {
+			$aggressive=1;
+			$flatten=1;
+			$delete_blanks=1;
 		}
 	}
 	if ($input_file eq "" || $output_file eq "") {
 		say "Input or output file not specified!!";
 		&print_usage();
 	}
-	return ($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten);
+	return ($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten,$aggressive);
 }
 
 sub parse_vars_from_file {
@@ -56,16 +63,27 @@ sub parse_vars_from_file {
 	my %vars=();
 	while(my $line=<$file_handle>) {
 		# First pull var names from declarations
-		if ($line =~ m/^[ \t]*([a-z]+[a-z0-9_]*)=/) {
-			$vars{$1}=1;
+		if ($line =~ m/^[ \t]*(local[ \t]*)?([a-z]+[a-z0-9_]*)=/) {
+			$vars{$2}=1;
 		# Then, from read statements
-		} elsif (($line =~ m/^[ \t]*read -s ([a-z]+[a-z0-9_]*)/) || ($line =~ m/^[ \t]*read ([a-z]+[a-z0-9_]*)/)) {
+		} elsif (($line =~ m/^.*read -s ([a-z]+[a-z0-9_]*)/) || ($line =~ m/^.*read ([a-z]+[a-z0-9_]*)+/)) {
+			while ($line =~ /read([^;]+);/g) {
+				for my $v (split(" ",$1)){
+					$vars{$v}=1;	
+				}
+			}
 			$vars{$1}=1;
 		# Then, from for loops
 		} elsif ($line =~ m/^[ \t]*for ([a-z]+[a-z0-9_]*) /) {
 			$vars{$1}=1;
 		# Then, from array access
 		} elsif ($line =~ m/^[ \t]*([a-z]+[a-z0-9_]*)\[.+\]=/) {
+			$vars{$1}=1;
+		# Then, from pre increment/decrement statements
+		} elsif ($line =~ m/^[ \t]*\(\( *[-+]{2}([a-z]+[a-z0-9_]*) *\)\)/) {
+			$vars{$1}=1;
+		# Then, from post increment/decrement statements
+		} elsif ($line =~ m/^[ \t]*\({2} *([a-z]+[a-z0-9_]*)[-+]{2} *\){2}/) {
 			$vars{$1}=1;
 		}
 	}
@@ -79,6 +97,7 @@ sub obfuscate {
 	my $new_variable_prefix=shift;
 	my $delete_blanks=shift;
 	my $flatten=shift;
+	my $aggressive=shift;
 	my @sorted_vars=@_;
 
 	open(my $ifh, "<", $input_file) || die "Couldn't open '".$input_file."' for reading because: ".$!;
@@ -97,15 +116,33 @@ sub obfuscate {
 		if ($flatten) {
 			$line =~ s/^[ \t]*//;
 		}
+		# clear ;-ending lines . This avoid bugs on aggressive mode
+		$line =~ s/([^;]);$/$1/;
+
 		for my $var (@sorted_vars) {
 			# Substitute var names in declarations
-			$line =~ s/^([ \t]*)$var=/$1$var_obfus{$var}=/;
+			$line =~ s/^([ \t]*(local[ \t]*)?)$var=/$1$var_obfus{$var}=/;
+
 			# Then, in read statements
-			$line =~ s/^([ \t]*read .*)$var/$1$var_obfus{$var}/;
+			while ($line =~ s/^(.*read .*)$var([ ;}'"\n])/$1$var_obfus{$var}$2/g){
+				# have no body
+			} 
+
 			# Then, in for loops
 			$line =~ s/^([ \t]*for )$var/$1$var_obfus{$var}/;
+
 			# Then, in array access
 			$line =~ s/^([ \t]*)$var(\[.+\]=)/$1$var_obfus{$var}$2/;
+
+			# Then, in array usage
+			$line =~ s/^(.*)$var(\[)/$1$var_obfus{$var}$2/;
+
+			# Then, in pre increment statements
+			$line =~ s/^([ \t]*\({2} *[-+]{2})$var/$1$var_obfus{$var}/;
+
+			# Then, in post increment statements
+			$line =~ s/^([ \t]*\({2} *)$var([-+]{2})/$1$var_obfus{$var}$2/;
+
 			# General "$" usage while making sure we're not inside ''
 			while ($line =~ m/^(([^\']*('[^']*')*[^']*)*)\$$var/) {
 				$line =~ s/^(([^\']*('[^']*')*[^']*)*)\$$var/$1\$$var_obfus{$var}/;
@@ -128,9 +165,36 @@ sub obfuscate {
 	}
 	close $ifh;
 	close $ofh;
+
+	# aggressive 
+	if ($aggressive) {
+		say "Aggressive mode";
+		my $var = <<EOS;
+		2,\${                                                   	# from second line to the end
+			:loop                                               	# label for loop behavior
+			N                                                   	# join next line with current, separating by \\n
+			s/\\(}\\|))\\|esac\\|done\\|fi\\)\\s*\\n/\\1;/g              	# line break to ';' on lines ending with '}', '))', 'esac','done' or 'fi'
+			s/\\(do\\|{\\||\\|then\\|else\\)\\s*\\n/\\1 /g               	# line break to ' ' on lines ending with 'do', '{', '|', 'then' or 'else'
+			s/\\n\\(function\\|while\\)/;\\1/g                       	# line break to ';' on lines starting with 'function' or 'while'
+			s/;;;/\\n;;/g                                        	# fix ;;; bug
+			s/\\(\\([^);]\\);\\?\\n\\(if\\|else\\|done\\|\\[\\)\\)/\\2;\\3/g  	# lines beginning by if, else, done or [ preceded by line break from lines not ending with ^,;,], should change \\n into ; 
+			s/\\("[^"]\\+"\\)\\n/\\1;/g                              	# lines ending with open and closed ", change \\n into ;
+			s/\\n\\([a-z][a-z0-9]*=.*\\)\\n/;\\1;/g                  	# var definition lines alone e.g. \\nvar=value\\n, change to ;var=value;
+			s/expect { /expect {\\n/g
+			b loop                                              	# repeat from loop label down
+		}
+EOS
+
+		open(my $ofh, ">", 'sed_aggressive.txt');
+		print $ofh $var;
+		close $ofh;
+
+		# apply 'aggressive' sed filters to output file
+		system("sed -i -f sed_aggressive.txt $output_file; rm sed_aggressive.txt");
+	}
 }
 
-my ($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten)=&parse_cmd_args();
+my ($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten,$aggressive)=&parse_cmd_args();
 my @parsed_vars=&parse_vars_from_file($input_file);
 my @sorted_vars = sort { length($b) <=> length($a) } @parsed_vars;
-&obfuscate($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten,@sorted_vars);
+&obfuscate($input_file,$output_file,$new_variable_prefix,$delete_blanks,$flatten,$aggressive,@sorted_vars);
